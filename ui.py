@@ -4,10 +4,32 @@ Run locally with (in a second terminal, alongside `uvicorn api:app`):
     streamlit run ui.py
 """
 
+import io
+
 import httpx
 import streamlit as st
+from pypdf import PdfReader
+from docx import Document
 
 API_URL = "http://localhost:8000"
+
+
+def _extract_text(uploaded_file) -> str:
+    name = uploaded_file.name.lower()
+    data = uploaded_file.getvalue()
+
+    if name.endswith(".txt"):
+        return data.decode("utf-8", errors="replace")
+
+    if name.endswith(".pdf"):
+        reader = PdfReader(io.BytesIO(data))
+        return "\n".join(page.extract_text() or "" for page in reader.pages)
+
+    if name.endswith(".docx"):
+        doc = Document(io.BytesIO(data))
+        return "\n".join(p.text for p in doc.paragraphs)
+
+    raise ValueError(f"Unsupported file type: {uploaded_file.name}")
 
 SAMPLE_CONTRACTS = {
     "Compliant vendor agreement": (
@@ -35,6 +57,8 @@ if "result" not in st.session_state:
     st.session_state.result = None
 if "contract_text" not in st.session_state:
     st.session_state.contract_text = ""
+if "processed_file_id" not in st.session_state:
+    st.session_state.processed_file_id = None
 
 
 def _load_sample(text: str) -> None:
@@ -60,10 +84,18 @@ with st.sidebar:
     except Exception:
         st.error("API not reachable — start it with:\nuvicorn api:app --reload --port 8000")
 
+uploaded_file = st.file_uploader("Upload a contract file", type=["txt", "pdf", "docx"])
+if uploaded_file is not None and uploaded_file.file_id != st.session_state.processed_file_id:
+    try:
+        st.session_state.contract_text = _extract_text(uploaded_file)
+        st.session_state.processed_file_id = uploaded_file.file_id
+    except Exception as exc:
+        st.error(f"Could not read {uploaded_file.name}: {exc}")
+
 contract_text = st.text_area(
     "Contract text",
     height=160,
-    placeholder="Paste raw contract text here...",
+    placeholder="Paste raw contract text here, or upload a file above...",
     key="contract_text",
 )
 
