@@ -5,13 +5,129 @@ Run locally with (in a second terminal, alongside `uvicorn api:app`):
 """
 
 import io
+import re
+from datetime import datetime, timezone
 
 import httpx
 import streamlit as st
 from pypdf import PdfReader
 from docx import Document
+from fpdf import FPDF
 
 API_URL = "http://localhost:8000"
+
+RISK_COLORS = {"LOW": (34, 139, 34), "MED": (191, 144, 0), "HIGH": (178, 34, 34)}
+
+
+def _pdf_safe(text: str) -> str:
+    """fpdf2's core fonts are latin-1 only; degrade unsupported characters."""
+    return text.encode("latin-1", "replace").decode("latin-1")
+
+
+def _build_report_pdf(result: dict) -> bytes:
+    report = result["report"]
+
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=18)
+    pdf.add_page()
+
+    pdf.set_font("Helvetica", "B", 18)
+    pdf.cell(0, 12, "DocuClear AI - Contract Compliance Report", new_x="LMARGIN", new_y="NEXT")
+
+    pdf.set_font("Helvetica", size=9)
+    pdf.set_text_color(110, 110, 110)
+    generated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    pdf.cell(0, 6, _pdf_safe(f"Thread {result['thread_id']}  |  Generated {generated}"), new_x="LMARGIN", new_y="NEXT")
+    pdf.set_text_color(0, 0, 0)
+    pdf.ln(4)
+
+    if result["security_flag"]:
+        pdf.set_font("Helvetica", "B", 13)
+        pdf.set_text_color(*RISK_COLORS["HIGH"])
+        pdf.multi_cell(0, 8, "BLOCKED BY SECURITY GUARD - malicious input detected. No further agents ran.", new_x="LMARGIN", new_y="NEXT")
+        pdf.set_text_color(0, 0, 0)
+        return bytes(pdf.output())
+
+    pdf.set_font("Helvetica", "B", 13)
+    pdf.cell(0, 9, "Summary", new_x="LMARGIN", new_y="NEXT")
+    pdf.set_draw_color(220, 220, 220)
+    pdf.line(pdf.get_x(), pdf.get_y(), 210 - pdf.r_margin, pdf.get_y())
+    pdf.ln(2)
+
+    pdf.set_font("Helvetica", size=11)
+    pdf.cell(0, 7, _pdf_safe(f"Contractor: {report['contractor_name']}"), new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 7, f"Review rounds: {report['review_rounds']}", new_x="LMARGIN", new_y="NEXT")
+    passed = report["compliance_passed"]
+    pdf.set_text_color(*(RISK_COLORS["LOW"] if passed else RISK_COLORS["HIGH"]))
+    pdf.cell(0, 7, f"Compliance passed: {'Yes' if passed else 'No'}", new_x="LMARGIN", new_y="NEXT")
+    pdf.set_text_color(0, 0, 0)
+
+    if result["interrupted"]:
+        payload = result["interrupt_payload"] or {}
+        pdf.set_text_color(*RISK_COLORS["MED"])
+        pdf.multi_cell(0, 7, _pdf_safe(f"Human-in-the-loop interrupt: {payload.get('reason', 'unresolved')}"), new_x="LMARGIN", new_y="NEXT")
+        pdf.set_text_color(0, 0, 0)
+
+    pdf.ln(4)
+    pdf.set_font("Helvetica", "B", 13)
+    pdf.cell(0, 9, "Clauses", new_x="LMARGIN", new_y="NEXT")
+    pdf.line(pdf.get_x(), pdf.get_y(), 210 - pdf.r_margin, pdf.get_y())
+    pdf.ln(2)
+
+    for clause in report["parsed_clauses"]:
+        pdf.set_font("Helvetica", "B", 11)
+        pdf.set_text_color(*RISK_COLORS[clause["risk_score"]])
+        pdf.multi_cell(0, 7, _pdf_safe(f"[{clause['risk_score']}] {clause['clause_type']}"), new_x="LMARGIN", new_y="NEXT")
+        pdf.set_text_color(0, 0, 0)
+
+        pdf.set_font("Helvetica", "I", 10)
+        pdf.multi_cell(0, 6, "Original:", new_x="LMARGIN", new_y="NEXT")
+        pdf.set_font("Helvetica", size=10)
+        pdf.multi_cell(0, 6, _pdf_safe(clause["original_text"]), new_x="LMARGIN", new_y="NEXT")
+
+        if clause["redrafted_text"]:
+            pdf.set_font("Helvetica", "I", 10)
+            pdf.multi_cell(0, 6, "Redrafted:", new_x="LMARGIN", new_y="NEXT")
+            pdf.set_font("Helvetica", size=10)
+            pdf.multi_cell(0, 6, _pdf_safe(clause["redrafted_text"]), new_x="LMARGIN", new_y="NEXT")
+
+        pdf.ln(4)
+
+    return bytes(pdf.output())
+
+
+def _clean_text(text: str) -> str:
+    """Turn raw extracted text into clean, properly-paragraphed prose.
+
+    PDF/DOCX extraction hard-wraps lines mid-sentence and leaves stray blank
+    lines; this rejoins wrapped lines within a paragraph while preserving
+    real paragraph breaks (blank lines) and short heading-like lines.
+    """
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"[ \t]+", " ", text)
+
+    paragraphs = re.split(r"\n\s*\n", text)
+    cleaned = []
+    for para in paragraphs:
+        lines = [ln.strip() for ln in para.split("\n") if ln.strip()]
+        if not lines:
+            continue
+        # Keep short, title-like lines (e.g. clause headings) on their own line;
+        # merge everything else into flowing sentences.
+        out_lines, buffer = [], []
+        for ln in lines:
+            if len(ln) <= 60 and not ln.endswith((".", ",", ";", ":")):
+                if buffer:
+                    out_lines.append(" ".join(buffer))
+                    buffer = []
+                out_lines.append(ln)
+            else:
+                buffer.append(ln)
+        if buffer:
+            out_lines.append(" ".join(buffer))
+        cleaned.append("\n".join(out_lines))
+
+    return "\n\n".join(cleaned).strip()
 
 
 def _extract_text(uploaded_file) -> str:
@@ -19,17 +135,17 @@ def _extract_text(uploaded_file) -> str:
     data = uploaded_file.getvalue()
 
     if name.endswith(".txt"):
-        return data.decode("utf-8", errors="replace")
-
-    if name.endswith(".pdf"):
+        raw = data.decode("utf-8", errors="replace")
+    elif name.endswith(".pdf"):
         reader = PdfReader(io.BytesIO(data))
-        return "\n".join(page.extract_text() or "" for page in reader.pages)
-
-    if name.endswith(".docx"):
+        raw = "\n".join(page.extract_text() or "" for page in reader.pages)
+    elif name.endswith(".docx"):
         doc = Document(io.BytesIO(data))
-        return "\n".join(p.text for p in doc.paragraphs)
+        raw = "\n".join(p.text for p in doc.paragraphs)
+    else:
+        raise ValueError(f"Unsupported file type: {uploaded_file.name}")
 
-    raise ValueError(f"Unsupported file type: {uploaded_file.name}")
+    return _clean_text(raw)
 
 SAMPLE_CONTRACTS = {
     "Compliant vendor agreement": (
@@ -94,7 +210,7 @@ if uploaded_file is not None and uploaded_file.file_id != st.session_state.proce
 
 contract_text = st.text_area(
     "Contract text",
-    height=160,
+    height=260,
     placeholder="Paste raw contract text here, or upload a file above...",
     key="contract_text",
 )
@@ -144,6 +260,13 @@ if result:
                 resp.raise_for_status()
                 st.session_state.result = resp.json()
                 st.rerun()
+
+    st.download_button(
+        "Download PDF report",
+        data=_build_report_pdf(result),
+        file_name=f"docuclear_report_{result['thread_id'][:8]}.pdf",
+        mime="application/pdf",
+    )
 
     report = result.get("report")
     if report and not result["security_flag"]:
