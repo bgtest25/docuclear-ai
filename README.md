@@ -43,7 +43,7 @@ trees (including paused interrupts) persist across process restarts.
 ```bash
 python -m venv venv
 source venv/Scripts/activate   # Windows: venv\Scripts\activate
-pip install langgraph langchain-anthropic langchain-community pydantic python-dotenv duckduckgo-search langgraph-checkpoint-sqlite
+pip install -r requirements.txt
 cp .env.example .env
 ```
 
@@ -51,6 +51,33 @@ Edit `.env` and set `ANTHROPIC_API_KEY` to a live key. If your key is
 **identity-linked** (rather than scoped to a single workspace), you'll also need to
 set `ANTHROPIC_WORKSPACE_ID` — find it in the Anthropic Console under
 Settings → Workspaces, or in the workspace's URL.
+
+## Running the full app locally
+
+The pipeline (`app.py`) is wrapped by a FastAPI service (`api.py`) and driven from
+a Streamlit UI (`ui.py`). Run both in separate terminals (same activated venv):
+
+```bash
+uvicorn api:app --reload --port 8000
+```
+
+```bash
+streamlit run ui.py
+```
+
+Open the Streamlit URL it prints (default `http://localhost:8501`). The sidebar
+has one-click sample contracts for all three test scenarios below. Submitting a
+hostile contract that survives 3 redraft rounds still `HIGH` will show the
+Executive Gate's interrupt banner with **Approve override** / **Reject** buttons,
+exactly mirroring the human General Counsel review step in the graph.
+
+API surface, if you want to drive it directly instead of the UI:
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /contracts` | Submit `{"contract_text": "..."}`, runs the full pipeline on a fresh thread |
+| `GET /contracts/{thread_id}` | Fetch current state of a thread |
+| `POST /contracts/{thread_id}/resume` | Resume a paused (interrupted) thread with `{"override": true/false}` |
 
 ## Running the tests
 
@@ -71,4 +98,9 @@ Runs three isolated scenarios on separate checkpointer threads:
 - Risk scoring and clause extraction are LLM-driven, so results can vary slightly
   between runs even with the same input.
 - The Regulatory Monitor's web search quality depends on DuckDuckGo result
-  availability at runtime.
+  availability at runtime, and requires the `ddgs` package (the older
+  `duckduckgo-search` package is deprecated upstream and no longer works with
+  `langchain_community`'s `DuckDuckGoSearchRun`).
+- `api.py` and `ui.py` are single-process, no-auth local dev tooling — fine for
+  testing the pipeline end-to-end, not hardened for a shared/production deployment
+  (no auth, no rate limiting, CORS wide open).

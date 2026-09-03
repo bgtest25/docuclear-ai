@@ -3,3 +3,6 @@ __pycache__/
 *.pyc
 .env
 audit_trail.db
+audit_trail.db-shm
+audit_trail.db-wal
+*.log
